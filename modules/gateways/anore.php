@@ -56,7 +56,7 @@ function anore_config()
             'FriendlyName' => 'Методы оплаты',
             'Type' => 'text',
             'Size' => '40',
-            'Description' => 'Необязательно. Например: sbp,yoomoney,crypto. Пусто — методы магазина.',
+            'Description' => 'Необязательно: sbp,card,yoomoney,crypto,crypto-old. Пусто — методы магазина.',
         ],
     ];
 }
@@ -69,8 +69,9 @@ function anore_link($params)
             throw new RuntimeException('Anore поддерживает счета WHMCS только в RUB и USD.');
         }
 
-        $amount = round((float) ($params['amount'] ?? 0), 2);
-        if ($amount <= 0) {
+        $minor = anore_moneyMinor($params['amount'] ?? 0);
+        $amount = $minor / 100;
+        if ($minor <= 0) {
             throw new RuntimeException('Сумма инвойса должна быть больше нуля.');
         }
 
@@ -79,60 +80,79 @@ function anore_link($params)
             throw new RuntimeException('WHMCS не передал ID инвойса.');
         }
 
-        $stored = anore_findReusablePayment($invoiceId);
-        if ($stored !== null) {
-            return anore_paymentButton($stored->payment_url, $params);
+        if (trim((string) ($params['webhookSecret'] ?? '')) === '') {
+            throw new RuntimeException('Не указан секрет вебхука магазина.');
         }
 
-        $returnUrl = trim((string) ($params['returnurl'] ?? ''));
-        $client = is_array($params['clientdetails'] ?? null) ? $params['clientdetails'] : [];
-        $description = trim((string) ($params['description'] ?? ''));
-        if ($description === '') {
-            $description = 'WHMCS invoice #' . $invoiceId;
-        }
-
-        $payload = [
-            'amount' => $amount,
-            'currency' => strtolower($currency),
-            'description' => $description,
-            'orderId' => (string) $invoiceId,
-            'getbackurl' => $returnUrl,
-            'successurl' => $returnUrl,
-            'failurl' => $returnUrl,
-        ];
-
-        $shopId = trim((string) ($params['shopId'] ?? ''));
-        if ($shopId !== '') {
-            if (!ctype_digit($shopId) || (int) $shopId <= 0) {
-                throw new RuntimeException('Shop ID должен быть положительным числом.');
+        $fingerprint = anore_requestFingerprint($params);
+        anore_ensureSchema();
+        return anore_withInvoiceLock($invoiceId, function () use ($params, $invoiceId, $minor, $amount, $currency, $fingerprint) {
+            anore_assertPayableInvoice($invoiceId, $currency, $minor);
+            $stored = anore_findReusablePayment($invoiceId, $amount, $currency, $fingerprint);
+            if ($stored !== null) {
+                return anore_paymentButton($stored->payment_url, $params);
             }
-            $payload['shopId'] = (int) $shopId;
-        }
 
-        $methods = array_values(array_filter(array_map('trim', explode(',', (string) ($params['methods'] ?? '')))));
-        if ($methods !== []) {
-            $payload['methods'] = $methods;
-        }
+            $returnUrl = trim((string) ($params['returnurl'] ?? ''));
+            $client = is_array($params['clientdetails'] ?? null) ? $params['clientdetails'] : [];
+            $description = trim((string) ($params['description'] ?? ''));
+            if ($description === '') {
+                $description = 'WHMCS invoice #' . $invoiceId;
+            }
 
-        $response = anore_apiRequest($params, 'POST', '/api/v1/payments', $payload);
-        if ($response['status'] < 200 || $response['status'] >= 300 || !is_array($response['json'])) {
-            anore_logApiFailure($params, $response, 'Create payment failed');
-            throw new RuntimeException(anore_apiErrorMessage($response));
-        }
+            $payload = [
+                'amount' => $amount,
+                'currency' => strtolower($currency),
+                'description' => $description,
+                'orderId' => (string) $invoiceId,
+                'getbackurl' => $returnUrl,
+                'successurl' => $returnUrl,
+                'failurl' => $returnUrl,
+                'callbackUrl' => anore_callbackUrl($params),
+            ];
 
-        $paymentId = trim((string) ($response['json']['id'] ?? ''));
-        $paymentUrl = trim((string) ($response['json']['paymentUrl'] ?? ''));
-        if ($paymentId === '' || !filter_var($paymentUrl, FILTER_VALIDATE_URL)) {
-            anore_logApiFailure($params, $response, 'Invalid create response');
-            throw new RuntimeException('Anore вернул неполный ответ при создании платежа.');
-        }
+            $email = trim((string) ($client['email'] ?? ''));
+            if ($email !== '') {
+                if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+                    throw new RuntimeException('Некорректный email клиента.');
+                }
+                $payload['email'] = $email;
+            }
 
-        $expiresIn = max(60, (int) ($response['json']['expiresIn'] ?? 14400));
-        anore_storePayment($invoiceId, $paymentId, $paymentUrl, $amount, $currency, $expiresIn);
+            $shopId = trim((string) ($params['shopId'] ?? ''));
+            if ($shopId !== '') {
+                if (!ctype_digit($shopId) || (int) $shopId <= 0) {
+                    throw new RuntimeException('Shop ID должен быть положительным числом.');
+                }
+                $payload['shopId'] = (int) $shopId;
+            }
 
-        return anore_paymentButton($paymentUrl, $params);
+            $methods = anore_paymentMethods($params);
+            if ($methods !== []) {
+                $payload['methods'] = $methods;
+            }
+
+            $response = anore_apiRequest($params, 'POST', '/api/v1/payments', $payload);
+            if ($response['status'] < 200 || $response['status'] >= 300 || !is_array($response['json'])) {
+                anore_logApiFailure($params, $response, 'Create payment failed');
+                throw new RuntimeException(anore_apiErrorMessage($response));
+            }
+
+            $paymentId = trim((string) ($response['json']['id'] ?? ''));
+            $paymentUrl = trim((string) ($response['json']['paymentUrl'] ?? ''));
+            if (!anore_validPaymentId($paymentId) || !filter_var($paymentUrl, FILTER_VALIDATE_URL)
+                || !preg_match('~^https?://~i', $paymentUrl)) {
+                anore_logApiFailure($params, $response, 'Invalid create response');
+                throw new RuntimeException('Anore вернул неполный ответ при создании платежа.');
+            }
+
+            $expiresIn = max(1, (int) ($response['json']['expiresIn'] ?? 14400));
+            anore_storePayment($invoiceId, $paymentId, $paymentUrl, $amount, $currency, $expiresIn, $fingerprint);
+
+            return anore_paymentButton($paymentUrl, $params);
+        });
     } catch (Throwable $error) {
-        logTransaction(
+        anore_safeLog(
             (string) ($params['name'] ?? 'anore'),
             ['invoiceId' => $params['invoiceid'] ?? null, 'error' => $error->getMessage()],
             'Payment initialization failed'
@@ -146,7 +166,7 @@ function anore_link($params)
 
 function anore_apiRequest(array $params, string $method, string $path, ?array $payload = null): array
 {
-    $apiUrl = rtrim(trim((string) ($params['apiUrl'] ?? '')), '/');
+    $apiUrl = anore_apiBase($params);
     $apiKey = trim((string) ($params['apiKey'] ?? ''));
     if (!filter_var($apiUrl, FILTER_VALIDATE_URL) || !preg_match('~^https?://~i', $apiUrl)) {
         throw new RuntimeException('Некорректный API URL.');
@@ -209,21 +229,19 @@ function anore_apiRequest(array $params, string $method, string $path, ?array $p
     ];
 }
 
-function anore_findReusablePayment(int $invoiceId)
+function anore_findReusablePayment(int $invoiceId, float $amount, string $currency, string $fingerprint)
 {
-    try {
-        anore_ensureSchema();
-        $row = \WHMCS\Database\Capsule::table('mod_anore_payments')
-            ->where('invoice_id', $invoiceId)
-            ->where('status', 'new')
-            ->orderBy('id', 'desc')
-            ->first();
+    $row = \WHMCS\Database\Capsule::table('mod_anore_payment_attempts')
+        ->where('invoice_id', $invoiceId)
+        ->where('amount', anore_moneyText($amount))
+        ->where('currency', $currency)
+        ->where('request_fingerprint', $fingerprint)
+        ->where('status', 'new')
+        ->orderBy('id', 'desc')
+        ->first();
 
-        if ($row !== null && strtotime((string) $row->expires_at) > time() + 30) {
-            return $row;
-        }
-    } catch (Throwable $error) {
-        logTransaction('anore', ['invoiceId' => $invoiceId, 'error' => $error->getMessage()], 'Payment cache read failed');
+    if ($row !== null && strtotime((string) $row->expires_at . ' UTC') > time() + 30) {
+        return $row;
     }
 
     return null;
@@ -235,7 +253,8 @@ function anore_storePayment(
     string $paymentUrl,
     float $amount,
     string $currency,
-    int $expiresIn
+    int $expiresIn,
+    string $fingerprint
 ): void
 {
     anore_ensureSchema();
@@ -243,46 +262,43 @@ function anore_storePayment(
     $values = [
         'payment_id' => $paymentId,
         'payment_url' => $paymentUrl,
-        'amount' => $amount,
+        'invoice_id' => $invoiceId,
+        'amount' => anore_moneyText($amount),
         'currency' => strtoupper($currency),
+        'request_fingerprint' => $fingerprint,
         'status' => 'new',
-        'expires_at' => gmdate('Y-m-d H:i:s', time() + $expiresIn - 30),
+        'expires_at' => gmdate('Y-m-d H:i:s', time() + $expiresIn),
+        'created_at' => $now,
         'updated_at' => $now,
     ];
 
-    $exists = \WHMCS\Database\Capsule::table('mod_anore_payments')
-        ->where('invoice_id', $invoiceId)
-        ->exists();
-    if ($exists) {
-        \WHMCS\Database\Capsule::table('mod_anore_payments')
-            ->where('invoice_id', $invoiceId)
-            ->update($values);
-    } else {
-        $values['invoice_id'] = $invoiceId;
-        $values['created_at'] = $now;
-        \WHMCS\Database\Capsule::table('mod_anore_payments')->insert($values);
-    }
+    \WHMCS\Database\Capsule::table('mod_anore_payment_attempts')->insert($values);
 }
 
 function anore_ensureSchema(): void
 {
+    static $ready = false;
+    if ($ready) return;
     $schema = \WHMCS\Database\Capsule::schema();
-    if ($schema->hasTable('mod_anore_payments')) {
-        return;
+    if (!$schema->hasTable('mod_anore_payment_attempts')) {
+        anore_withLock('anore:schema:v2', function () use ($schema) {
+            if ($schema->hasTable('mod_anore_payment_attempts')) return;
+            $schema->create('mod_anore_payment_attempts', function ($table) {
+                $table->increments('id');
+                $table->unsignedInteger('invoice_id')->index();
+                $table->string('payment_id', 64)->unique();
+                $table->text('payment_url');
+                $table->decimal('amount', 18, 2);
+                $table->string('currency', 8);
+                $table->string('request_fingerprint', 64);
+                $table->string('status', 24)->default('new');
+                $table->dateTime('expires_at');
+                $table->dateTime('created_at');
+                $table->dateTime('updated_at');
+            });
+        });
     }
-
-    $schema->create('mod_anore_payments', function ($table) {
-        $table->increments('id');
-        $table->unsignedInteger('invoice_id')->unique();
-        $table->string('payment_id', 64)->unique();
-        $table->text('payment_url');
-        $table->decimal('amount', 18, 2);
-        $table->string('currency', 8);
-        $table->string('status', 24)->default('new');
-        $table->dateTime('expires_at');
-        $table->dateTime('created_at');
-        $table->dateTime('updated_at');
-    });
+    $ready = true;
 }
 
 function anore_paymentButton(string $paymentUrl, array $params): string
@@ -292,9 +308,8 @@ function anore_paymentButton(string $paymentUrl, array $params): string
         $label = 'Оплатить';
     }
 
-    return '<form method="get" action="' . anore_escape($paymentUrl) . '">'
-        . '<button type="submit" class="btn btn-primary">' . anore_escape($label) . '</button>'
-        . '</form>';
+    return '<a class="btn btn-primary" href="' . anore_escape($paymentUrl) . '">'
+        . anore_escape($label) . '</a>';
 }
 
 function anore_apiErrorMessage(array $response): string
@@ -317,7 +332,7 @@ function anore_apiErrorMessage(array $response): string
 
 function anore_logApiFailure(array $params, array $response, string $status): void
 {
-    logTransaction(
+    anore_safeLog(
         (string) ($params['name'] ?? 'anore'),
         [
             'httpStatus' => $response['status'] ?? 0,
@@ -331,4 +346,128 @@ function anore_logApiFailure(array $params, array $response, string $status): vo
 function anore_escape(string $value): string
 {
     return htmlspecialchars($value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+}
+
+function anore_safeLog(string $gateway, array $data, string $status): void
+{
+    try {
+        logTransaction($gateway, $data, $status);
+    } catch (Throwable $error) {
+        error_log('[anore] Gateway log unavailable (' . get_class($error) . ')');
+    }
+}
+
+function anore_apiBase(array $params): string
+{
+    $url = rtrim(trim((string) ($params['apiUrl'] ?? '')), '/');
+    if ($url === '') $url = 'https://api.anore.cc';
+    return preg_replace('~/(?:api/)?v1$~i', '', $url);
+}
+
+function anore_callbackUrl(array $params): string
+{
+    $url = rtrim(trim((string) ($params['systemurl'] ?? '')), '/') . '/modules/gateways/callback/anore.php';
+    if (!filter_var($url, FILTER_VALIDATE_URL) || !preg_match('~^https?://~i', $url)) {
+        throw new RuntimeException('Не задан корректный System URL WHMCS.');
+    }
+    return $url;
+}
+
+function anore_requestFingerprint(array $params): string
+{
+    return hash('sha256', json_encode([
+        anore_apiBase($params), trim((string) ($params['apiKey'] ?? '')),
+        trim((string) ($params['shopId'] ?? '')), anore_paymentMethods($params),
+        anore_callbackUrl($params), trim((string) ($params['clientdetails']['email'] ?? '')),
+    ], JSON_THROW_ON_ERROR));
+}
+
+function anore_paymentMethods(array $params): array
+{
+    $methods = [];
+    foreach (explode(',', (string) ($params['methods'] ?? '')) as $method) {
+        $method = strtolower(trim($method));
+        if ($method === '') continue;
+        $method = ['dvnet' => 'crypto', 'xrocket' => 'crypto-old'][$method] ?? $method;
+        if (!in_array($method, ['sbp', 'card', 'yoomoney', 'crypto', 'crypto-old'], true)) {
+            throw new RuntimeException('Указан неизвестный метод оплаты Anore.');
+        }
+        $methods[] = $method;
+    }
+    return array_values(array_unique($methods));
+}
+
+function anore_validPaymentId(string $id): bool
+{
+    return (bool) preg_match('/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i', $id);
+}
+
+function anore_moneyMinor($value): int
+{
+    if (is_float($value)) {
+        if (!is_finite($value)) throw new InvalidArgumentException('Invalid monetary amount');
+        $value = number_format($value, 2, '.', '');
+    }
+    if (!is_string($value) && !is_int($value)) throw new InvalidArgumentException('Invalid monetary amount');
+    $value = trim((string) $value);
+    if (!preg_match('/^([0-9]{1,12})(?:\.([0-9]{1,2}))?$/', $value, $parts)) {
+        throw new InvalidArgumentException('Invalid monetary amount');
+    }
+    return (int) $parts[1] * 100 + (int) str_pad($parts[2] ?? '', 2, '0');
+}
+
+function anore_moneyText($value): string
+{
+    $minor = anore_moneyMinor($value);
+    return intdiv($minor, 100) . '.' . str_pad((string) ($minor % 100), 2, '0', STR_PAD_LEFT);
+}
+
+function anore_withInvoiceLock(int $invoiceId, callable $callback)
+{
+    return anore_withLock('anore:invoice:' . $invoiceId, $callback);
+}
+
+function anore_invoiceForCurrency(int $invoiceId, string $currency)
+{
+    $invoice = \WHMCS\Database\Capsule::table('tblinvoices')->where('id', $invoiceId)->first();
+    if ($invoice === null) throw new InvalidArgumentException('Invoice not found');
+    $client = \WHMCS\Database\Capsule::table('tblclients')->where('id', $invoice->userid)->first();
+    if ($client === null) throw new InvalidArgumentException('Invoice client not found');
+    $storedCurrency = \WHMCS\Database\Capsule::table('tblcurrencies')->where('id', $client->currency)->first();
+    if ($storedCurrency === null || strtoupper((string) $storedCurrency->code) !== $currency) {
+        throw new InvalidArgumentException('Валюта обработки должна совпадать с валютой инвойса. Отключите Convert To For Processing для Anore.');
+    }
+    return $invoice;
+}
+
+function anore_assertPayableInvoice(int $invoiceId, string $currency, int $amountMinor): void
+{
+    anore_invoiceForCurrency($invoiceId, $currency);
+    $invoice = localAPI('GetInvoice', ['invoiceid' => $invoiceId]);
+    if (!is_array($invoice) || ($invoice['result'] ?? '') !== 'success'
+        || (int) ($invoice['invoiceid'] ?? 0) !== $invoiceId) {
+        throw new RuntimeException('Не удалось проверить текущий остаток инвойса WHMCS. Повторите попытку.');
+    }
+    $balance = anore_moneyMinor($invoice['balance'] ?? null);
+    if (in_array($invoice['status'] ?? '', ['Paid', 'Cancelled', 'Draft'], true) || $balance <= 0) {
+        throw new RuntimeException('Этот инвойс уже оплачен или закрыт для оплаты. Обновите страницу.');
+    }
+    if ($balance !== $amountMinor) {
+        throw new RuntimeException('Сумма к оплате изменилась. Обновите страницу инвойса.');
+    }
+}
+
+function anore_withLock(string $name, callable $callback)
+{
+    $connection = \WHMCS\Database\Capsule::connection();
+    $lock = $connection->selectOne('SELECT GET_LOCK(?, 10) AS acquired', [$name]);
+    if ($lock === null || (int) $lock->acquired !== 1) throw new RuntimeException('Payment is being processed; retry later');
+    try {
+        return $callback();
+    } finally {
+        try {
+            $connection->selectOne('SELECT RELEASE_LOCK(?) AS released', [$name]);
+        } catch (Throwable $ignored) {
+        }
+    }
 }
