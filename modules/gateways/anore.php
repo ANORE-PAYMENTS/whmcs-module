@@ -58,6 +58,66 @@ function anore_config()
             'Size' => '40',
             'Description' => 'Необязательно: sbp,card,yoomoney,crypto,crypto-old. Пусто — методы магазина.',
         ],
+        'identitySource' => [
+            'FriendlyName' => 'Источник user_identity',
+            'Type' => 'dropdown',
+            'Options' => [
+                'external_id' => 'ID клиента из инвойса (рекомендуется)',
+                'email' => 'Email клиента',
+                'telegram_id' => 'Telegram ID из custom field',
+            ],
+            'Default' => 'external_id',
+            'Description' => 'ANORE скоро сделает user_identity обязательным. Значение отправляется при каждом создании платежа.',
+        ],
+        'telegramIdCustomFieldId' => [
+            'FriendlyName' => 'Custom field ID для Telegram ID',
+            'Type' => 'text',
+            'Size' => '12',
+            'Description' => 'Только числовой ID клиентского custom field. Обязательно при источнике Telegram; имя поля не используется.',
+        ],
+        'telegramUsernameCustomFieldId' => [
+            'FriendlyName' => 'Custom field ID для Telegram username',
+            'Type' => 'text',
+            'Size' => '12',
+            'Description' => 'Необязательный числовой ID клиентского custom field. Имя поля не используется.',
+        ],
+        'franchiseMode' => [
+            'FriendlyName' => 'Режим франшизы магазина',
+            'Type' => 'dropdown',
+            'Options' => [
+                'disabled' => 'Выключен — franchise запрещён',
+                'enabled' => 'Включён — franchise обязателен',
+            ],
+            'Default' => 'disabled',
+            'Description' => 'Должен точно совпадать с режимом выбранного магазина ANORE.',
+        ],
+        'franchiseType' => [
+            'FriendlyName' => 'Тип франшизы',
+            'Type' => 'dropdown',
+            'Options' => [
+                'telegram_bot' => 'Telegram bot',
+                'website' => 'Website',
+            ],
+            'Default' => 'telegram_bot',
+        ],
+        'franchiseAddress' => [
+            'FriendlyName' => 'Адрес франшизы',
+            'Type' => 'text',
+            'Size' => '60',
+            'Description' => 'Username бота или HTTPS origin сайта. Обязательно в режиме франшизы.',
+        ],
+        'franchiseOwnerTelegramId' => [
+            'FriendlyName' => 'Telegram ID владельца франшизы',
+            'Type' => 'text',
+            'Size' => '24',
+            'Description' => 'Положительный Telegram ID владельца, без пробелов и ведущих нулей.',
+        ],
+        'franchiseOwnerTelegramUsername' => [
+            'FriendlyName' => 'Telegram username владельца',
+            'Type' => 'text',
+            'Size' => '40',
+            'Description' => 'Необязательно: 5–32 символа A–Z, 0–9 и _.',
+        ],
     ];
 }
 
@@ -84,52 +144,15 @@ function anore_link($params)
             throw new RuntimeException('Не указан секрет вебхука магазина.');
         }
 
-        $fingerprint = anore_requestFingerprint($params);
         anore_ensureSchema();
-        return anore_withInvoiceLock($invoiceId, function () use ($params, $invoiceId, $minor, $amount, $currency, $fingerprint) {
-            anore_assertPayableInvoice($invoiceId, $currency, $minor);
+        return anore_withInvoiceLock($invoiceId, function () use ($params, $invoiceId, $minor, $amount, $currency) {
+            $invoice = anore_assertPayableInvoice($invoiceId, $currency, $minor);
+            $paymentContext = anore_paymentContext($params, $invoice);
+            $payload = anore_paymentPayload($params, $invoiceId, $amount, $currency, $paymentContext);
+            $fingerprint = anore_requestFingerprint($params, $payload);
             $stored = anore_findReusablePayment($invoiceId, $amount, $currency, $fingerprint);
             if ($stored !== null) {
                 return anore_paymentButton($stored->payment_url, $params);
-            }
-
-            $returnUrl = trim((string) ($params['returnurl'] ?? ''));
-            $client = is_array($params['clientdetails'] ?? null) ? $params['clientdetails'] : [];
-            $description = trim((string) ($params['description'] ?? ''));
-            if ($description === '') {
-                $description = 'WHMCS invoice #' . $invoiceId;
-            }
-
-            $payload = [
-                'amount' => $amount,
-                'currency' => strtolower($currency),
-                'description' => $description,
-                'orderId' => (string) $invoiceId,
-                'getbackurl' => $returnUrl,
-                'successurl' => $returnUrl,
-                'failurl' => $returnUrl,
-                'callbackUrl' => anore_callbackUrl($params),
-            ];
-
-            $email = trim((string) ($client['email'] ?? ''));
-            if ($email !== '') {
-                if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
-                    throw new RuntimeException('Некорректный email клиента.');
-                }
-                $payload['email'] = $email;
-            }
-
-            $shopId = trim((string) ($params['shopId'] ?? ''));
-            if ($shopId !== '') {
-                if (!ctype_digit($shopId) || (int) $shopId <= 0) {
-                    throw new RuntimeException('Shop ID должен быть положительным числом.');
-                }
-                $payload['shopId'] = (int) $shopId;
-            }
-
-            $methods = anore_paymentMethods($params);
-            if ($methods !== []) {
-                $payload['methods'] = $methods;
             }
 
             $response = anore_apiRequest($params, 'POST', '/api/v1/payments', $payload);
@@ -154,7 +177,7 @@ function anore_link($params)
     } catch (Throwable $error) {
         anore_safeLog(
             (string) ($params['name'] ?? 'anore'),
-            ['invoiceId' => $params['invoiceid'] ?? null, 'error' => $error->getMessage()],
+            ['invoiceId' => $params['invoiceid'] ?? null, 'errorClass' => get_class($error)],
             'Payment initialization failed'
         );
 
@@ -336,8 +359,7 @@ function anore_logApiFailure(array $params, array $response, string $status): vo
         (string) ($params['name'] ?? 'anore'),
         [
             'httpStatus' => $response['status'] ?? 0,
-            'response' => $response['json'] ?? substr((string) ($response['body'] ?? ''), 0, 2000),
-            'transportError' => $response['error'] ?? '',
+            'transportFailed' => trim((string) ($response['error'] ?? '')) !== '',
         ],
         $status
     );
@@ -373,13 +395,249 @@ function anore_callbackUrl(array $params): string
     return $url;
 }
 
-function anore_requestFingerprint(array $params): string
+function anore_requestFingerprint(array $params, array $payload): string
 {
-    return hash('sha256', json_encode([
-        anore_apiBase($params), trim((string) ($params['apiKey'] ?? '')),
-        trim((string) ($params['shopId'] ?? '')), anore_paymentMethods($params),
-        anore_callbackUrl($params), trim((string) ($params['clientdetails']['email'] ?? '')),
-    ], JSON_THROW_ON_ERROR));
+    $request = [
+        'api_base' => anore_apiBase($params),
+        'api_key' => trim((string) ($params['apiKey'] ?? '')),
+        'payload' => $payload,
+    ];
+    return hash('sha256', json_encode(
+        anore_canonicalize($request),
+        JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRESERVE_ZERO_FRACTION
+    ));
+}
+
+function anore_canonicalize(array $value): array
+{
+    if (array_is_list($value)) {
+        return array_map(function ($item) {
+            return is_array($item) ? anore_canonicalize($item) : $item;
+        }, $value);
+    }
+
+    ksort($value, SORT_STRING);
+    foreach ($value as &$item) {
+        if (is_array($item)) {
+            $item = anore_canonicalize($item);
+        }
+    }
+    unset($item);
+    return $value;
+}
+
+function anore_paymentPayload(
+    array $params,
+    int $invoiceId,
+    float $amount,
+    string $currency,
+    array $paymentContext
+): array
+{
+    $returnUrl = trim((string) ($params['returnurl'] ?? ''));
+    $description = trim((string) ($params['description'] ?? ''));
+    if ($description === '') {
+        $description = 'WHMCS invoice #' . $invoiceId;
+    }
+
+    $payload = [
+        'amount' => $amount,
+        'currency' => strtolower($currency),
+        'description' => $description,
+        'orderId' => (string) $invoiceId,
+        'getbackurl' => $returnUrl,
+        'successurl' => $returnUrl,
+        'failurl' => $returnUrl,
+        'callbackUrl' => anore_callbackUrl($params),
+        'user_identity' => $paymentContext['user_identity'],
+    ];
+    if ($paymentContext['franchise'] !== null) {
+        $payload['franchise'] = $paymentContext['franchise'];
+    }
+
+    $client = is_array($params['clientdetails'] ?? null) ? $params['clientdetails'] : [];
+    $rawEmail = trim((string) ($client['email'] ?? ''));
+    if ($rawEmail !== '') {
+        $email = anore_payerEmail($rawEmail);
+        if ($email === null) {
+            throw new RuntimeException('Некорректный email клиента.');
+        }
+        $payload['email'] = $email;
+    }
+
+    $shopId = trim((string) ($params['shopId'] ?? ''));
+    if ($shopId !== '') {
+        if (!ctype_digit($shopId) || (int) $shopId <= 0) {
+            throw new RuntimeException('Shop ID должен быть положительным числом.');
+        }
+        $payload['shopId'] = (int) $shopId;
+    }
+
+    $methods = anore_paymentMethods($params);
+    if ($methods !== []) {
+        $payload['methods'] = $methods;
+    }
+    return $payload;
+}
+
+function anore_payerEmail($value): ?string
+{
+    if (!is_string($value)) return null;
+    $email = strtolower(trim($value));
+    if (strlen($email) > 254) return null;
+    return preg_match(
+        "/^[A-Z0-9.!#$%&'*+\\/=\\?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?(?:\\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+$/iD",
+        $email
+    ) ? $email : null;
+}
+
+function anore_paymentContext(array $params, $invoice): array
+{
+    $clientId = (int) ($invoice->userid ?? 0);
+    if ($clientId <= 0) {
+        throw new RuntimeException('Инвойс не содержит корректный ID клиента.');
+    }
+
+    $source = trim((string) ($params['identitySource'] ?? 'external_id'));
+    if ($source === 'external_id') {
+        $identity = ['type' => 'external_id', 'value' => (string) $clientId];
+    } elseif ($source === 'email') {
+        $email = anore_payerEmail($params['clientdetails']['email'] ?? null);
+        if ($email === null) {
+            throw new RuntimeException('Для user_identity нужен корректный email клиента.');
+        }
+        $identity = ['type' => 'email', 'value' => $email];
+    } elseif ($source === 'telegram_id') {
+        $fieldId = anore_positiveFieldId($params['telegramIdCustomFieldId'] ?? '', 'Telegram ID');
+        $telegramId = anore_customFieldValue($clientId, $fieldId);
+        if (!anore_validTelegramId($telegramId)) {
+            throw new RuntimeException('Custom field Telegram ID должен содержать канонический положительный Telegram ID.');
+        }
+        $identity = ['type' => 'telegram_id', 'value' => $telegramId];
+        $usernameField = trim((string) ($params['telegramUsernameCustomFieldId'] ?? ''));
+        if ($usernameField !== '') {
+            $username = anore_telegramUsername(anore_customFieldValue(
+                $clientId,
+                anore_positiveFieldId($usernameField, 'Telegram username')
+            ));
+            if ($username !== null) {
+                $identity['telegram_username'] = $username;
+            }
+        }
+    } else {
+        throw new RuntimeException('Неизвестный источник user_identity.');
+    }
+
+    $mode = trim((string) ($params['franchiseMode'] ?? 'disabled'));
+    if (!in_array($mode, ['disabled', 'enabled'], true)) {
+        throw new RuntimeException('Режим франшизы должен быть явно включён или выключен.');
+    }
+
+    return [
+        'user_identity' => $identity,
+        'franchise' => $mode === 'enabled' ? anore_franchise($params) : null,
+    ];
+}
+
+function anore_positiveFieldId($value, string $label): int
+{
+    $value = trim((string) $value);
+    if (!preg_match('/^[1-9][0-9]{0,9}$/', $value)) {
+        throw new RuntimeException($label . ': укажите числовой ID custom field.');
+    }
+    return (int) $value;
+}
+
+function anore_customFieldValue(int $clientId, int $fieldId): string
+{
+    $field = \WHMCS\Database\Capsule::table('tblcustomfields')
+        ->where('id', $fieldId)
+        ->where('type', 'client')
+        ->first();
+    if ($field === null) {
+        throw new RuntimeException('Настроенный ID не является клиентским custom field.');
+    }
+    $row = \WHMCS\Database\Capsule::table('tblcustomfieldsvalues')
+        ->where('fieldid', $fieldId)
+        ->where('relid', $clientId)
+        ->first();
+    return trim((string) ($row->value ?? ''));
+}
+
+function anore_validTelegramId(string $value): bool
+{
+    return (bool) preg_match('/^[1-9][0-9]{0,18}$/', $value)
+        && (strlen($value) < 19 || strcmp($value, '9223372036854775807') <= 0);
+}
+
+function anore_telegramUsername(string $value): ?string
+{
+    $value = anore_stripOptionalAt(trim($value));
+    if ($value === '') return null;
+    if (!preg_match('/^[A-Za-z0-9_]{5,32}$/', $value)) {
+        throw new RuntimeException('Telegram username должен содержать 5–32 символа A–Z, 0–9 или _.');
+    }
+    return strtolower($value);
+}
+
+function anore_stripOptionalAt(string $value): string
+{
+    return str_starts_with($value, '@') ? substr($value, 1) : $value;
+}
+
+function anore_franchise(array $params): array
+{
+    $type = trim((string) ($params['franchiseType'] ?? ''));
+    if (!in_array($type, ['telegram_bot', 'website'], true)) {
+        throw new RuntimeException('Выберите корректный тип франшизы.');
+    }
+    $address = trim((string) ($params['franchiseAddress'] ?? ''));
+    if ($type === 'telegram_bot') {
+        $address = anore_stripOptionalAt($address);
+        if (!preg_match('/^[A-Za-z0-9_]{5,32}$/', $address)) {
+            throw new RuntimeException('Адрес Telegram bot должен содержать 5–32 символа A–Z, 0–9 или _.');
+        }
+        $address = strtolower($address);
+    } else {
+        $address = anore_httpsOrigin($address);
+    }
+
+    $ownerId = trim((string) ($params['franchiseOwnerTelegramId'] ?? ''));
+    if (!anore_validTelegramId($ownerId)) {
+        throw new RuntimeException('Telegram ID владельца франшизы должен быть каноническим положительным ID.');
+    }
+    $franchise = ['type' => $type, 'address' => $address, 'owner_telegram_id' => $ownerId];
+    $ownerUsername = anore_telegramUsername((string) ($params['franchiseOwnerTelegramUsername'] ?? ''));
+    if ($ownerUsername !== null) {
+        $franchise['owner_telegram_username'] = $ownerUsername;
+    }
+    return $franchise;
+}
+
+function anore_httpsOrigin(string $value): string
+{
+    $parts = parse_url($value);
+    if (!is_array($parts) || strtolower((string) ($parts['scheme'] ?? '')) !== 'https'
+        || trim((string) ($parts['host'] ?? '')) === '' || isset($parts['user']) || isset($parts['pass'])
+        || isset($parts['port']) || isset($parts['query']) || isset($parts['fragment'])
+        || !in_array((string) ($parts['path'] ?? ''), ['', '/'], true)) {
+        throw new RuntimeException('Адрес website должен быть HTTPS origin без credentials, порта, пути, query или fragment.');
+    }
+    $host = strtolower((string) $parts['host']);
+    if (str_ends_with($host, '.')) {
+        $host = substr($host, 0, -1);
+    }
+    if (function_exists('idn_to_ascii')) {
+        $ascii = idn_to_ascii($host, IDNA_DEFAULT, INTL_IDNA_VARIANT_UTS46);
+        if ($ascii === false) throw new RuntimeException('Некорректный IDN в адресе website.');
+        $host = strtolower($ascii);
+    } elseif (!preg_match('/^[a-z0-9.-]+$/', $host)) {
+        throw new RuntimeException('Для IDN-адреса website требуется PHP Intl.');
+    }
+    if (!filter_var($host, FILTER_VALIDATE_DOMAIN, FILTER_FLAG_HOSTNAME)) {
+        throw new RuntimeException('Некорректный host в адресе website.');
+    }
+    return 'https://' . $host;
 }
 
 function anore_paymentMethods(array $params): array
@@ -440,9 +698,9 @@ function anore_invoiceForCurrency(int $invoiceId, string $currency)
     return $invoice;
 }
 
-function anore_assertPayableInvoice(int $invoiceId, string $currency, int $amountMinor): void
+function anore_assertPayableInvoice(int $invoiceId, string $currency, int $amountMinor)
 {
-    anore_invoiceForCurrency($invoiceId, $currency);
+    $storedInvoice = anore_invoiceForCurrency($invoiceId, $currency);
     $invoice = localAPI('GetInvoice', ['invoiceid' => $invoiceId]);
     if (!is_array($invoice) || ($invoice['result'] ?? '') !== 'success'
         || (int) ($invoice['invoiceid'] ?? 0) !== $invoiceId) {
@@ -455,6 +713,7 @@ function anore_assertPayableInvoice(int $invoiceId, string $currency, int $amoun
     if ($balance !== $amountMinor) {
         throw new RuntimeException('Сумма к оплате изменилась. Обновите страницу инвойса.');
     }
+    return $storedInvoice;
 }
 
 function anore_withLock(string $name, callable $callback)
