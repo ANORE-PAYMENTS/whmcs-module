@@ -340,9 +340,17 @@ try {
     assert.equal('franchise' in request.body, false)
   })
   await test('email identity is canonicalized and sent explicitly', async () => {
-    await createPayment({ identitySource: 'email', clientdetails: { email: '  Customer@Example.TEST ' } })
-    assert.deepEqual(apiRequests[0].body.user_identity, { type: 'email', value: 'customer@example.test' })
+    await createPayment({ identitySource: 'email', clientdetails: { email: '  Buyer+Order@Example.TEST ' } })
+    assert.equal(apiRequests[0].body.email, 'buyer+order@example.test')
+    assert.deepEqual(apiRequests[0].body.user_identity, { type: 'email', value: 'buyer+order@example.test' })
   })
+  for (const identitySource of ['external_id', 'email']) {
+    await test(`quoted local-part email is rejected before API request for ${identitySource}`, async () => {
+      const html = await createPayment({ identitySource, clientdetails: { email: '"quoted.local"@example.com' } })
+      assert.match(html, /alert-danger/)
+      assert.equal(apiRequests.length, 0)
+    })
+  }
   await test('Telegram identity uses configured numeric custom field IDs only', async () => {
     await createPayment({
       identitySource: 'telegram_id', telegramIdCustomFieldId: '7', telegramUsernameCustomFieldId: '8',
@@ -403,6 +411,30 @@ try {
     })
     assert.equal(apiRequests.length, 3)
   })
+  await test('description and return URL changes invalidate the cached payment fingerprint', async () => {
+    await createPayment()
+    await createPayment({ description: 'Updated invoice description' })
+    await createPayment({ returnurl: 'https://billing.example.test/new-return' })
+    assert.equal(apiRequests.length, 3)
+    assert.equal(apiRequests[1].body.description, 'Updated invoice description')
+    assert.equal(apiRequests[2].body.getbackurl, 'https://billing.example.test/new-return')
+    assert.equal(apiRequests[2].body.successurl, 'https://billing.example.test/new-return')
+    assert.equal(apiRequests[2].body.failurl, 'https://billing.example.test/new-return')
+  })
+  for (const [field, value] of [
+    ['franchiseAddress', '@@Store_Bot'],
+    ['franchiseOwnerTelegramUsername', '@@Store_Owner'],
+  ]) {
+    await test(`multiple leading @ in ${field} is rejected before API request`, async () => {
+      const html = await createPayment({
+        franchiseMode: 'enabled', franchiseType: 'telegram_bot', franchiseAddress: 'store_bot',
+        franchiseOwnerTelegramId: '987654321', franchiseOwnerTelegramUsername: 'store_owner',
+        [field]: value,
+      })
+      assert.match(html, /alert-danger/)
+      assert.equal(apiRequests.length, 0)
+    })
+  }
   await test('API failures do not put raw response evidence into logs', async () => {
     apiResponseOverride = { message: 'failure with customer@example.test and 123456789' }
     const html = await createPayment()
