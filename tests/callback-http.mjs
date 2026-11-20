@@ -33,6 +33,7 @@ function creationParams(overrides = {}) {
     webhookSecret: secret, invoiceid: 42, amount: '123.45', currency: 'RUB', shopId: '27',
     systemurl: 'https://billing.example.test/clients/', returnurl: 'https://billing.example.test/viewinvoice.php?id=42',
     clientdetails: { email: 'customer@example.test' }, methods: 'sbp,card,crypto-old,card',
+    identitySource: 'external_id', franchiseMode: 'disabled',
     ...overrides,
   }
 }
@@ -67,6 +68,14 @@ function baseState() {
       tblinvoices: [{ id: 42, userid: 1, status: 'Unpaid', paymentmethod: 'anore', total: '123.45' }],
       tblclients: [{ id: 1, currency: 1 }],
       tblcurrencies: [{ id: 1, code: 'RUB' }],
+      tblcustomfields: [
+        { id: 7, type: 'client', fieldname: 'Internal Telegram ID' },
+        { id: 8, type: 'client', fieldname: 'Internal Telegram Username' },
+      ],
+      tblcustomfieldsvalues: [
+        { id: 1, fieldid: 7, relid: 1, value: '123456789' },
+        { id: 2, fieldid: 8, relid: 1, value: '@Customer_Name' },
+      ],
       tblaccounts: [],
     },
     logs: [], credits: [], locks: [], advisoryLocks: [],
@@ -327,6 +336,80 @@ try {
     assert.deepEqual(request.body.methods, ['sbp', 'card', 'crypto-old'])
     assert.equal(request.body.amount, 123.45)
     assert.equal(request.body.currency, 'rub')
+    assert.deepEqual(request.body.user_identity, { type: 'external_id', value: '1' })
+    assert.equal('franchise' in request.body, false)
+  })
+  await test('email identity is canonicalized and sent explicitly', async () => {
+    await createPayment({ identitySource: 'email', clientdetails: { email: '  Customer@Example.TEST ' } })
+    assert.deepEqual(apiRequests[0].body.user_identity, { type: 'email', value: 'customer@example.test' })
+  })
+  await test('Telegram identity uses configured numeric custom field IDs only', async () => {
+    await createPayment({
+      identitySource: 'telegram_id', telegramIdCustomFieldId: '7', telegramUsernameCustomFieldId: '8',
+    })
+    assert.deepEqual(apiRequests[0].body.user_identity, {
+      type: 'telegram_id', value: '123456789', telegram_username: '@customer_name',
+    })
+  })
+  await test('Telegram custom field name is never accepted as configuration', async () => {
+    const html = await createPayment({ identitySource: 'telegram_id', telegramIdCustomFieldId: 'Internal Telegram ID' })
+    assert.match(html, /alert-danger/)
+    assert.equal(apiRequests.length, 0)
+  })
+  await test('invoice owner is authoritative for external identity', async () => {
+    await createPayment({ clientdetails: { email: 'customer@example.test', id: 999, userid: 999 } })
+    assert.deepEqual(apiRequests[0].body.user_identity, { type: 'external_id', value: '1' })
+  })
+  await test('enabled franchise mode sends canonical Telegram branch context', async () => {
+    await createPayment({
+      franchiseMode: 'enabled', franchiseType: 'telegram_bot', franchiseAddress: '@Store_Bot',
+      franchiseOwnerTelegramId: '987654321', franchiseOwnerTelegramUsername: '@Store_Owner',
+    })
+    assert.deepEqual(apiRequests[0].body.franchise, {
+      type: 'telegram_bot', address: 'store_bot', owner_telegram_id: '987654321',
+      owner_telegram_username: '@store_owner',
+    })
+  })
+  await test('enabled website franchise accepts only a canonical HTTPS origin', async () => {
+    await createPayment({
+      franchiseMode: 'enabled', franchiseType: 'website', franchiseAddress: 'https://Shop.Example.TEST/',
+      franchiseOwnerTelegramId: '987654321',
+    })
+    assert.deepEqual(apiRequests[0].body.franchise, {
+      type: 'website', address: 'https://shop.example.test', owner_telegram_id: '987654321',
+    })
+  })
+  for (const franchiseAddress of ['http://shop.example.test', 'https://shop.example.test/path', 'https://user@shop.example.test']) {
+    await test(`unsafe franchise origin ${franchiseAddress} is rejected before API request`, async () => {
+      const html = await createPayment({
+        franchiseMode: 'enabled', franchiseType: 'website', franchiseAddress,
+        franchiseOwnerTelegramId: '987654321',
+      })
+      assert.match(html, /alert-danger/)
+      assert.equal(apiRequests.length, 0)
+    })
+  }
+  await test('enabled franchise mode requires valid owner and address before API request', async () => {
+    const html = await createPayment({ franchiseMode: 'enabled', franchiseType: 'telegram_bot' })
+    assert.match(html, /alert-danger/)
+    assert.equal(apiRequests.length, 0)
+  })
+  await test('identity and franchise changes invalidate the cached payment fingerprint', async () => {
+    await createPayment()
+    await createPayment({ identitySource: 'email' })
+    await createPayment({
+      franchiseMode: 'enabled', franchiseType: 'telegram_bot', franchiseAddress: 'store_bot',
+      franchiseOwnerTelegramId: '987654321',
+    })
+    assert.equal(apiRequests.length, 3)
+  })
+  await test('API failures do not put raw response evidence into logs', async () => {
+    apiResponseOverride = { message: 'failure with customer@example.test and 123456789' }
+    const html = await createPayment()
+    assert.match(html, /alert-danger/)
+    const logs = (await state()).logs
+    assert.ok(logs.length > 0)
+    assert.doesNotMatch(JSON.stringify(logs), /customer@example\.test|123456789/)
   })
   await test('reloading an unchanged invoice reuses its UTC cached attempt', async () => {
     const first = await createPayment()
