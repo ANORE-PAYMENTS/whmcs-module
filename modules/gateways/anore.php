@@ -533,7 +533,7 @@ function anore_telegramUsername(string $value): ?string
     if (!preg_match('/^[A-Za-z0-9_]{5,32}$/', $value)) {
         throw new RuntimeException('Telegram username должен содержать 5–32 символа A–Z, 0–9 или _.');
     }
-    return '@' . strtolower($value);
+    return strtolower($value);
 }
 
 function anore_franchise(array $params): array
@@ -575,6 +575,9 @@ function anore_httpsOrigin(string $value): string
         throw new RuntimeException('Адрес website должен быть HTTPS origin без credentials, порта, пути, query или fragment.');
     }
     $host = strtolower((string) $parts['host']);
+    if (str_ends_with($host, '.')) {
+        $host = substr($host, 0, -1);
+    }
     if (function_exists('idn_to_ascii')) {
         $ascii = idn_to_ascii($host, IDNA_DEFAULT, INTL_IDNA_VARIANT_UTS46);
         if ($ascii === false) throw new RuntimeException('Некорректный IDN в адресе website.');
