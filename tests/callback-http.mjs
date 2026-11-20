@@ -348,7 +348,7 @@ try {
       identitySource: 'telegram_id', telegramIdCustomFieldId: '7', telegramUsernameCustomFieldId: '8',
     })
     assert.deepEqual(apiRequests[0].body.user_identity, {
-      type: 'telegram_id', value: '123456789', telegram_username: '@customer_name',
+      type: 'telegram_id', value: '123456789', telegram_username: 'customer_name',
     })
   })
   await test('Telegram custom field name is never accepted as configuration', async () => {
@@ -367,7 +367,7 @@ try {
     })
     assert.deepEqual(apiRequests[0].body.franchise, {
       type: 'telegram_bot', address: 'store_bot', owner_telegram_id: '987654321',
-      owner_telegram_username: '@store_owner',
+      owner_telegram_username: 'store_owner',
     })
   })
   await test('enabled website franchise accepts only a canonical HTTPS origin', async () => {
